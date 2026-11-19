@@ -83,8 +83,26 @@ func TestFontGlyphs(t *testing.T) {
 func TestUnknownOpcodes(t *testing.T) {
 	for _, op := range []uint16{
 		0x0000, 0x0123, 0x00e1, 0x00ef, // 0NNN other than 00E0/00EE
-		0x8001, // not implemented yet
+		// 8XYn values that are not CHIP-8 instructions (n is 8-D or F)
+		0x8008, 0x8019, 0x802a, 0x803b, 0x804c, 0x805d, 0x806f,
 	} {
+		t.Run(fmt.Sprintf("%04x", op), func(t *testing.T) {
+			m := newMachineWithROM(t, []byte{byte(op >> 8), byte(op)})
+			ok, err := stepNoPanic(t, m)
+			if !ok {
+				return
+			}
+			wantErrContaining(t, err, fmt.Sprintf("%04x", op))
+		})
+	}
+}
+
+// TEMPORARY: 8XY6, 8XY7 and 8XYE are valid CHIP-8 instructions that are not
+// implemented yet. When one is implemented, delete its entry here and write real
+// tests for it, including the quirks that affect it (shifts use VY on the
+// original hardware).
+func TestNotYetImplemented8XYn(t *testing.T) {
+	for _, op := range []uint16{0x8016, 0x8017, 0x801e} {
 		t.Run(fmt.Sprintf("%04x", op), func(t *testing.T) {
 			m := newMachineWithROM(t, []byte{byte(op >> 8), byte(op)})
 			ok, err := stepNoPanic(t, m)
@@ -332,5 +350,584 @@ func TestDrawSpriteClippingAndVF(t *testing.T) {
 	}
 	if n := litPixels(m.disp); n != 6 {
 		t.Errorf("%d pixels lit, want 6", n)
+	}
+}
+
+// run8 runs `8XYn` after loading VX = a and VY = b. VF is first set to 0xaa, so
+// that a flag the instruction fails to write is visible. If X or Y is VF itself,
+// that register is loaded with a or b instead. X and Y may be the same register,
+// but then a and b must be equal, since there is only one value to load.
+func run8(t *testing.T, n, x, y, a, b byte) *Machine {
+	t.Helper()
+	if x == y && a != b {
+		t.Fatalf("run8: X and Y are both V%x, but a = %02x and b = %02x differ", x, a, b)
+	}
+	var rom []byte
+	steps := 0
+	emit := func(hi, lo byte) {
+		rom = append(rom, hi, lo)
+		steps++
+	}
+	if x != 0xf && y != 0xf {
+		emit(0x6f, 0xaa) // LD VF, aa
+	}
+	emit(0x60|x, a)      // LD VX, a
+	emit(0x60|y, b)      // LD VY, b
+	emit(0x80|x, y<<4|n) // 8XYn
+	m := newMachineWithROM(t, rom)
+	for range steps {
+		step(t, m)
+	}
+	return m
+}
+
+func TestLoadAndLogicVxVy(t *testing.T) {
+	tests := []struct {
+		name string
+		n    byte
+		a, b byte
+		want byte // VX afterwards
+	}{
+		{"8XY0 copy", 0x0, 0x12, 0x34, 0x34},
+		{"8XY0 copy zero", 0x0, 0xff, 0x00, 0x00},
+		{"8XY1 or", 0x1, 0xf0, 0x0f, 0xff},
+		{"8XY1 or overlapping", 0x1, 0x81, 0x03, 0x83},
+		{"8XY2 and", 0x2, 0xf0, 0x3c, 0x30},
+		{"8XY2 and disjoint", 0x2, 0xf0, 0x0f, 0x00},
+		{"8XY3 xor", 0x3, 0xff, 0x0f, 0xf0},
+		{"8XY3 xor overlapping", 0x3, 0x81, 0x03, 0x82},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := run8(t, tt.n, 3, 4, tt.a, tt.b)
+			if m.regV[3] != tt.want {
+				t.Errorf("V3 = %02x, want %02x", m.regV[3], tt.want)
+			}
+			if m.regV[4] != tt.b {
+				t.Errorf("V4 = %02x, want it unchanged at %02x", m.regV[4], tt.b)
+			}
+			for i, v := range m.regV {
+				// VF is not asserted for the logic ops: whether they reset it is a
+				// quirk (the original COSMAC VIP does)
+				if i != 3 && i != 4 && i != 0xf && v != 0 {
+					t.Errorf("V%x = %02x, want 0", i, v)
+				}
+			}
+		})
+	}
+}
+
+// With the same register on both sides, X ends up holding Y's value, so these
+// reduce to operations on one value.
+func TestLogicVxVxSameRegister(t *testing.T) {
+	tests := []struct {
+		name string
+		n    byte
+		want byte
+	}{
+		{"copy", 0x0, 0x5a},
+		{"or", 0x1, 0x5a},
+		{"and", 0x2, 0x5a},
+		{"xor", 0x3, 0x00},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := run8(t, tt.n, 2, 2, 0x5a, 0x5a)
+			if m.regV[2] != tt.want {
+				t.Errorf("V2 = %02x, want %02x", m.regV[2], tt.want)
+			}
+		})
+	}
+}
+
+func TestAddVxVy(t *testing.T) {
+	tests := []struct {
+		a, b  byte
+		want  byte
+		carry byte
+	}{
+		{1, 2, 3, 0},
+		{0, 0, 0, 0},
+		{0xff, 0, 0xff, 0},
+		{0xfe, 1, 0xff, 0}, // the largest sum that does not carry
+		{0xff, 1, 0x00, 1}, // the smallest sum that does
+		{0x80, 0x80, 0x00, 1},
+		{0xff, 0xff, 0xfe, 1},
+	}
+	for _, tt := range tests {
+		t.Run(fmt.Sprintf("%02x+%02x", tt.a, tt.b), func(t *testing.T) {
+			m := run8(t, 0x4, 3, 4, tt.a, tt.b)
+			if m.regV[3] != tt.want {
+				t.Errorf("V3 = %02x, want %02x", m.regV[3], tt.want)
+			}
+			if m.regV[0xf] != tt.carry {
+				t.Errorf("VF = %02x, want %02x", m.regV[0xf], tt.carry)
+			}
+			if m.regV[4] != tt.b {
+				t.Errorf("V4 = %02x, want it unchanged at %02x", m.regV[4], tt.b)
+			}
+		})
+	}
+}
+
+// 8XY5 sets VX = VX - VY, and VF to 1 when there is NO borrow (VX >= VY), 0 when
+// there is one.
+func TestSubVxVy(t *testing.T) {
+	tests := []struct {
+		a, b     byte
+		want     byte
+		noBorrow byte
+	}{
+		{5, 3, 2, 1},
+		{3, 5, 0xfe, 0},
+		{5, 5, 0, 1}, // equal does not borrow
+		{0, 0, 0, 1},
+		{0xff, 0, 0xff, 1},
+		{0, 1, 0xff, 0},
+		{0x80, 0x7f, 0x01, 1},
+		{0x7f, 0x80, 0xff, 0},
+	}
+	for _, tt := range tests {
+		t.Run(fmt.Sprintf("%02x-%02x", tt.a, tt.b), func(t *testing.T) {
+			m := run8(t, 0x5, 3, 4, tt.a, tt.b)
+			if m.regV[3] != tt.want {
+				t.Errorf("V3 = %02x, want %02x", m.regV[3], tt.want)
+			}
+			if m.regV[0xf] != tt.noBorrow {
+				t.Errorf("VF = %02x, want %02x", m.regV[0xf], tt.noBorrow)
+			}
+			if m.regV[4] != tt.b {
+				t.Errorf("V4 = %02x, want it unchanged at %02x", m.regV[4], tt.b)
+			}
+		})
+	}
+}
+
+// The flag is written after the result, so when X is VF the flag wins; and when Y
+// is VF the old value of VF is the operand.
+func TestAddSubWithVF(t *testing.T) {
+	t.Run("add, X is VF", func(t *testing.T) {
+		m := run8(t, 0x4, 0xf, 1, 0xff, 0x01) // VF = ff + 01 = 00, carry
+		if m.regV[0xf] != 1 {
+			t.Errorf("VF = %02x, want 01 (the flag, not the sum)", m.regV[0xf])
+		}
+	})
+	t.Run("add, X is VF, no carry", func(t *testing.T) {
+		m := run8(t, 0x4, 0xf, 1, 0x01, 0x01) // VF = 01 + 01 = 02, no carry
+		if m.regV[0xf] != 0 {
+			t.Errorf("VF = %02x, want 00 (the flag, not the sum)", m.regV[0xf])
+		}
+	})
+	t.Run("add, Y is VF", func(t *testing.T) {
+		m := run8(t, 0x4, 0, 0xf, 0x01, 0xff) // V0 = 01 + ff = 00, carry
+		if m.regV[0] != 0 || m.regV[0xf] != 1 {
+			t.Errorf("V0 = %02x, VF = %02x; want 00 and 01", m.regV[0], m.regV[0xf])
+		}
+	})
+	t.Run("sub, X is VF", func(t *testing.T) {
+		m := run8(t, 0x5, 0xf, 1, 0x05, 0x03) // VF = 05 - 03 = 02, no borrow
+		if m.regV[0xf] != 1 {
+			t.Errorf("VF = %02x, want 01 (the flag, not the difference)", m.regV[0xf])
+		}
+	})
+	t.Run("sub, Y is VF", func(t *testing.T) {
+		m := run8(t, 0x5, 0, 0xf, 0x03, 0x05) // V0 = 03 - 05 = fe, borrow
+		if m.regV[0] != 0xfe || m.regV[0xf] != 0 {
+			t.Errorf("V0 = %02x, VF = %02x; want fe and 00", m.regV[0], m.regV[0xf])
+		}
+	})
+}
+
+// With X and Y both VF, the operand is VF's value, and the flag still wins over
+// the result.
+func TestAddSubBothVF(t *testing.T) {
+	tests := []struct {
+		name string
+		n    byte
+		vf   byte
+		want byte
+	}{
+		{"add, carry", 0x4, 0x80, 1},    // 80 + 80 = 100, carry
+		{"add, no carry", 0x4, 0x01, 0}, // 01 + 01 = 02, no carry
+		{"sub", 0x5, 0x37, 1},           // x - x = 0, no borrow
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := run8(t, tt.n, 0xf, 0xf, tt.vf, tt.vf)
+			if m.regV[0xf] != tt.want {
+				t.Errorf("VF = %02x, want %02x", m.regV[0xf], tt.want)
+			}
+		})
+	}
+}
+
+func TestAddSubSameRegister(t *testing.T) {
+	// VX op VX: the operand is the value just loaded
+	m := run8(t, 0x4, 2, 2, 0x80, 0x80)
+	if m.regV[2] != 0 || m.regV[0xf] != 1 {
+		t.Errorf("0x80 + 0x80: V2 = %02x, VF = %02x; want 00 and 01", m.regV[2], m.regV[0xf])
+	}
+	m = run8(t, 0x5, 2, 2, 0x80, 0x80)
+	if m.regV[2] != 0 || m.regV[0xf] != 1 {
+		t.Errorf("0x80 - 0x80: V2 = %02x, VF = %02x; want 00 and 01", m.regV[2], m.regV[0xf])
+	}
+}
+
+// runSkip loads the registers given by setup (pairs of register number and
+// value), runs the single instruction op, then runs the instruction that
+// follows it, and reports whether that following instruction was skipped. The
+// following instruction is `LD VE, 1` and the one after it is `LD VD, 1`, so
+// exactly one of them runs.
+func runSkip(t *testing.T, op uint16, setup ...[2]byte) (skipped bool, m *Machine) {
+	t.Helper()
+	var rom []byte
+	for _, s := range setup {
+		rom = append(rom, 0x60|s[0], s[1]) // LD V<reg>, value
+	}
+	rom = append(rom, byte(op>>8), byte(op), 0x6e, 0x01, 0x6d, 0x01)
+	m = newMachineWithROM(t, rom)
+	for range len(setup) {
+		step(t, m)
+	}
+	pcAtSkip := m.pc
+	step(t, m) // the skip instruction itself
+	switch want := pcAtSkip + 2; {
+	case m.pc == want:
+		skipped = false
+	case m.pc == want+2:
+		skipped = true
+	default:
+		t.Fatalf("pc = %04x after the skip instruction at %04x, want %04x or %04x", m.pc, pcAtSkip, want, want+2)
+	}
+	step(t, m) // whichever instruction comes next
+	switch {
+	case skipped && (m.regV[0xd] != 1 || m.regV[0xe] != 0):
+		t.Fatalf("skipped, but VE = %d and VD = %d; want the first instruction not to run", m.regV[0xe], m.regV[0xd])
+	case !skipped && (m.regV[0xe] != 1 || m.regV[0xd] != 0):
+		t.Fatalf("not skipped, but VE = %d and VD = %d; want the first instruction to run", m.regV[0xe], m.regV[0xd])
+	}
+	return skipped, m
+}
+
+// The skip tests below use one table per opcode family: each row loads V2 (and
+// V3 for the register forms) and says whether the next instruction is skipped.
+
+func TestSkipEqualImmediate(t *testing.T) { // 3XNN
+	tests := []struct {
+		name        string
+		vx, nn      byte
+		wantSkipped bool
+	}{
+		{"equal", 0x42, 0x42, true},
+		{"not equal", 0x42, 0x43, false},
+		{"equal zero", 0x00, 0x00, true},
+		{"equal ff", 0xff, 0xff, true},
+		{"differ in the low bit", 0x43, 0x42, false},
+		{"differ in the high bit", 0xc2, 0x42, false},
+		{"zero against nonzero", 0x00, 0x01, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			skipped, m := runSkip(t, 0x3200|uint16(tt.nn), [2]byte{2, tt.vx})
+			if skipped != tt.wantSkipped {
+				t.Errorf("skipped = %v, want %v", skipped, tt.wantSkipped)
+			}
+			if m.regV[2] != tt.vx {
+				t.Errorf("V2 = %02x, want it unchanged at %02x", m.regV[2], tt.vx)
+			}
+		})
+	}
+}
+
+func TestSkipNotEqualImmediate(t *testing.T) { // 4XNN
+	tests := []struct {
+		name        string
+		vx, nn      byte
+		wantSkipped bool
+	}{
+		{"equal", 0x42, 0x42, false},
+		{"not equal", 0x42, 0x43, true},
+		{"equal zero", 0x00, 0x00, false},
+		{"equal ff", 0xff, 0xff, false},
+		{"differ in the low bit", 0x43, 0x42, true},
+		{"differ in the high bit", 0xc2, 0x42, true},
+		{"zero against nonzero", 0x00, 0x01, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			skipped, m := runSkip(t, 0x4200|uint16(tt.nn), [2]byte{2, tt.vx})
+			if skipped != tt.wantSkipped {
+				t.Errorf("skipped = %v, want %v", skipped, tt.wantSkipped)
+			}
+			if m.regV[2] != tt.vx {
+				t.Errorf("V2 = %02x, want it unchanged at %02x", m.regV[2], tt.vx)
+			}
+		})
+	}
+}
+
+func TestSkipEqualRegisters(t *testing.T) { // 5XY0
+	tests := []struct {
+		name        string
+		vx, vy      byte
+		wantSkipped bool
+	}{
+		{"equal", 0x42, 0x42, true},
+		{"not equal", 0x42, 0x43, false},
+		{"equal zero", 0x00, 0x00, true},
+		{"equal ff", 0xff, 0xff, true},
+		{"differ in the high bit", 0xc2, 0x42, false},
+		{"zero against nonzero", 0x00, 0x01, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			skipped, m := runSkip(t, 0x5230, [2]byte{2, tt.vx}, [2]byte{3, tt.vy})
+			if skipped != tt.wantSkipped {
+				t.Errorf("skipped = %v, want %v", skipped, tt.wantSkipped)
+			}
+			if m.regV[2] != tt.vx || m.regV[3] != tt.vy {
+				t.Errorf("V2 = %02x, V3 = %02x, want them unchanged at %02x and %02x", m.regV[2], m.regV[3], tt.vx, tt.vy)
+			}
+		})
+	}
+}
+
+func TestSkipNotEqualRegisters(t *testing.T) { // 9XY0
+	tests := []struct {
+		name        string
+		vx, vy      byte
+		wantSkipped bool
+	}{
+		{"equal", 0x42, 0x42, false},
+		{"not equal", 0x42, 0x43, true},
+		{"equal zero", 0x00, 0x00, false},
+		{"equal ff", 0xff, 0xff, false},
+		{"differ in the high bit", 0xc2, 0x42, true},
+		{"zero against nonzero", 0x00, 0x01, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			skipped, m := runSkip(t, 0x9230, [2]byte{2, tt.vx}, [2]byte{3, tt.vy})
+			if skipped != tt.wantSkipped {
+				t.Errorf("skipped = %v, want %v", skipped, tt.wantSkipped)
+			}
+			if m.regV[2] != tt.vx || m.regV[3] != tt.vy {
+				t.Errorf("V2 = %02x, V3 = %02x, want them unchanged at %02x and %02x", m.regV[2], m.regV[3], tt.vx, tt.vy)
+			}
+		})
+	}
+}
+
+// Comparing a register with itself is always equal.
+func TestSkipSameRegister(t *testing.T) {
+	for _, tt := range []struct {
+		op          uint16
+		wantSkipped bool
+	}{
+		{0x5220, true},
+		{0x9220, false},
+	} {
+		t.Run(fmt.Sprintf("%04x", tt.op), func(t *testing.T) {
+			skipped, _ := runSkip(t, tt.op, [2]byte{2, 0x77})
+			if skipped != tt.wantSkipped {
+				t.Errorf("skipped = %v, want %v", skipped, tt.wantSkipped)
+			}
+		})
+	}
+}
+
+// The flag register takes part in comparisons like any other, and a skip never
+// writes to it.
+func TestSkipWithVF(t *testing.T) {
+	tests := []struct {
+		name        string
+		op          uint16
+		vf, v2      byte // loaded before the skip; v2 is only used by the register forms
+		wantSkipped bool
+	}{
+		// VF holds values no skip handler would plausibly write, so that a stray
+		// write to it cannot look like "unchanged"
+		{"3XNN with VF", 0x3fa7, 0xa7, 0, true},
+		{"3XNN with VF, not equal", 0x3fa7, 0xa8, 0, false},
+		{"4XNN with VF", 0x4fa7, 0xa8, 0, true},
+		{"4XNN with VF, equal", 0x4fa7, 0xa7, 0, false},
+		{"5XY0 with VF as X", 0x5f20, 0xb9, 0xb9, true},
+		{"5XY0 with VF as Y", 0x52f0, 0xb9, 0xba, false},
+		{"9XY0 with VF as X", 0x9f20, 0xb9, 0xba, true},
+		{"9XY0 with VF as Y", 0x92f0, 0xb9, 0xb9, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			skipped, m := runSkip(t, tt.op, [2]byte{0xf, tt.vf}, [2]byte{2, tt.v2})
+			if skipped != tt.wantSkipped {
+				t.Errorf("skipped = %v, want %v", skipped, tt.wantSkipped)
+			}
+			if m.regV[0xf] != tt.vf {
+				t.Errorf("VF = %02x, want it unchanged at %02x", m.regV[0xf], tt.vf)
+			}
+		})
+	}
+}
+
+// A skip can test the flag an arithmetic instruction just wrote.
+func TestSkipOnArithmeticFlag(t *testing.T) {
+	tests := []struct {
+		name        string
+		n           byte // 8XY4 or 8XY5
+		a, b        byte
+		skipIfVF    byte // 3F<this> skips when VF equals it
+		wantSkipped bool
+	}{
+		{"carry", 0x4, 0xff, 0x01, 1, true},
+		{"VF is cleared when there is no carry", 0x4, 0x01, 0x01, 0xaa, false},
+		{"no carry", 0x4, 0x01, 0x01, 1, false},
+		{"no carry, skip on zero", 0x4, 0x01, 0x01, 0, true},
+		{"no borrow", 0x5, 0x05, 0x03, 1, true},
+		{"borrow", 0x5, 0x03, 0x05, 0, true},
+		{"borrow, skip on one", 0x5, 0x03, 0x05, 1, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// LD VF, aa (a sentinel, so that a flag the instruction fails to write
+			// is visible); LD V0, a; LD V1, b; 8014/8015; SE VF, x; LD VE, 1;
+			// LD VD, 1
+			m := newMachineWithROM(t, []byte{
+				0x6f, 0xaa, 0x60, tt.a, 0x61, tt.b, 0x80, 0x10 | tt.n,
+				0x3f, tt.skipIfVF, 0x6e, 0x01, 0x6d, 0x01,
+			})
+			for range 6 { // four set-up instructions, the skip, then whichever follows
+				step(t, m)
+			}
+			ranFirst, ranSecond := m.regV[0xe] == 1, m.regV[0xd] == 1
+			if ranFirst == ranSecond {
+				t.Fatalf("VE = %d, VD = %d; want exactly one of the two loads to have run", m.regV[0xe], m.regV[0xd])
+			}
+			if skipped := ranSecond; skipped != tt.wantSkipped {
+				t.Errorf("skipped = %v, want %v (VF = %d)", skipped, tt.wantSkipped, m.regV[0xf])
+			}
+		})
+	}
+}
+
+// 5XYn and 9XYn are only skips when n is 0. The other values are not
+// instructions, and must not behave like a skip.
+func TestSkipRegistersRequireZeroLowNibble(t *testing.T) {
+	for _, family := range []uint16{0x5000, 0x9000} {
+		for n := uint16(1); n <= 0xf; n++ {
+			op := family | 0x230 | n
+			t.Run(fmt.Sprintf("%04x", op), func(t *testing.T) {
+				// V2 == V3 and V2 != V3 would both skip if n were ignored
+				for _, vy := range []byte{0x10, 0x11} {
+					m := newMachineWithROM(t, []byte{0x62, 0x10, 0x63, vy, byte(op >> 8), byte(op), 0x6e, 0x01})
+					step(t, m)
+					step(t, m)
+					pc := m.pc
+					ok, err := stepNoPanic(t, m)
+					if !ok {
+						return
+					}
+					wantErrContaining(t, err, fmt.Sprintf("%04x", op))
+					if m.pc != pc+InstructionSize {
+						t.Errorf("pc = %04x, want %04x: an invalid instruction must not skip", m.pc, pc+InstructionSize)
+					}
+				}
+			})
+		}
+	}
+}
+
+// A skip jumps over exactly the next instruction, and that instruction has no
+// effect at all, whatever it is.
+func TestSkipDoesNotExecuteSkippedInstruction(t *testing.T) {
+	tests := []struct {
+		name    string
+		skipped []byte // the two bytes of the instruction that gets skipped
+		check   func(t *testing.T, m *Machine)
+	}{
+		{"a call", []byte{0x22, 0x10}, func(t *testing.T, m *Machine) {
+			if m.sp != 0 {
+				t.Errorf("sp = %d, a skipped CALL must not push", m.sp)
+			}
+		}},
+		{"a jump", []byte{0x1f, 0xff}, func(t *testing.T, m *Machine) {
+			if m.pc != RomAddress+8 { // past LD I, SE, the skipped jump and LD V1
+				t.Errorf("pc = %04x, want %04x", m.pc, RomAddress+8)
+			}
+		}},
+		{"a draw", []byte{0xd0, 0x15}, func(t *testing.T, m *Machine) {
+			if n := litPixels(m.disp); n != 0 {
+				t.Errorf("%d pixels lit, a skipped DRW must draw nothing", n)
+			}
+		}},
+		{"a load", []byte{0x65, 0x99}, func(t *testing.T, m *Machine) {
+			if m.regV[5] != 0 {
+				t.Errorf("V5 = %02x, a skipped LD must not run", m.regV[5])
+			}
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// LD I, font "0" (so that a draw would light pixels); SE V0, 0 (always
+			// true); <skipped>; LD V1, 1
+			rom := append([]byte{0xa0, 0x50, 0x30, 0x00}, tt.skipped...)
+			rom = append(rom, 0x61, 0x01)
+			m := newMachineWithROM(t, rom)
+			step(t, m) // LD I
+			step(t, m) // the skip
+			step(t, m) // LD V1
+			if m.regV[1] != 1 {
+				t.Errorf("V1 = %d, want the instruction after the skipped one to run", m.regV[1])
+			}
+			tt.check(t, m)
+		})
+	}
+}
+
+// Two skips in a row: the second is the instruction that gets skipped, so it is
+// not evaluated.
+func TestSkipOverASkip(t *testing.T) {
+	// SE V0, 0 (true: skips the next); SNE V0, 1 (would skip, but is skipped);
+	// LD V1, 1 (must run)
+	m := newMachineWithROM(t, []byte{0x30, 0x00, 0x40, 0x01, 0x61, 0x01, 0x62, 0x01})
+	step(t, m)
+	step(t, m)
+	if m.regV[1] != 1 || m.regV[2] != 0 {
+		t.Errorf("V1 = %d, V2 = %d; want 1 and 0", m.regV[1], m.regV[2])
+	}
+}
+
+// A skip as the last instruction in memory is fine in itself: it leaves the
+// program counter past the end, and it is the next fetch that fails.
+func TestSkipAtEndOfMemory(t *testing.T) {
+	m := newMachineWithROM(t, nil)
+	m.pc = MemSize - InstructionSize // 0xffe
+	m.mem[m.pc], m.mem[m.pc+1] = 0x30, 0x00
+	if ok, err := stepNoPanic(t, m); ok && err != nil {
+		t.Fatalf("skip at the last address returned an error: %s", err)
+	}
+	// The fetch moved pc to 0x1000, and the skip moved it on by another 2
+	if want := uint16(MemSize + InstructionSize); m.pc != want {
+		t.Errorf("pc = %04x, want %04x", m.pc, want)
+	}
+	ok, err := stepNoPanic(t, m)
+	if ok {
+		wantErrContaining(t, err, "memory")
+	}
+}
+
+// A skip at 0xFFC lands the program counter exactly at the end of memory.
+func TestSkipLandsAtEndOfMemory(t *testing.T) {
+	m := newMachineWithROM(t, nil)
+	m.pc = MemSize - 2*InstructionSize // 0xffc
+	m.mem[m.pc], m.mem[m.pc+1] = 0x30, 0x00
+	if ok, err := stepNoPanic(t, m); ok && err != nil {
+		t.Fatalf("skip returned an error: %s", err)
+	}
+	if m.pc != MemSize {
+		t.Errorf("pc = %04x, want %04x", m.pc, MemSize)
+	}
+	ok, err := stepNoPanic(t, m)
+	if ok {
+		wantErrContaining(t, err, "memory")
 	}
 }
