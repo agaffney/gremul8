@@ -43,6 +43,17 @@ func TestCHIP8Logo(t *testing.T) {
 	testROM(t, "testdata/1-chip8-logo.ch8", "testdata/1-chip8-logo.txt", 39)
 }
 
+// Corax+ exercises 3XNN, 4XNN, 5XY0, 9XY0, 7XNN, all of 8XY*, FX1E, FX33,
+// FX55 and FX65, and draws a checkmark (pass) or cross (fail) next to each test.
+//
+// testdata/3-corax+.txt is the published all-checkmarks screen, pictures/corax+.png
+// in github.com/Timendus/chip8-test-suite, converted to pixels. It was not
+// produced by this emulator. The 306-step count is this emulator's own, and is
+// only a regression guard.
+func TestCorax(t *testing.T) {
+	testROM(t, "testdata/3-corax+.ch8", "testdata/3-corax+.txt", 306)
+}
+
 // ---------------------------------------------------------------------------
 // Drawing
 // ---------------------------------------------------------------------------

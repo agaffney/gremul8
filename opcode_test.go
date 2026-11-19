@@ -85,24 +85,12 @@ func TestUnknownOpcodes(t *testing.T) {
 		0x0000, 0x0123, 0x00e1, 0x00ef, // 0NNN other than 00E0/00EE
 		// 8XYn values that are not CHIP-8 instructions (n is 8-D or F)
 		0x8008, 0x8019, 0x802a, 0x803b, 0x804c, 0x805d, 0x806f,
+		// FXnn values that are not instructions in CHIP-8, SCHIP or XO-CHIP, so
+		// they should stay unimplemented. (Avoid the real ones: 07, 0A, 15, 18,
+		// 1E, 29, 33, 55, 65; SCHIP's 30, 75, 85; XO-CHIP's 00 and 01 (F000,
+		// FN01), 02 (F002), 3A (FX3A), 75 and 85.)
+		0xf0fe, 0xf0ff, 0xf1fe, 0xf132, 0xf256, 0xf3a5, 0xf464, 0xfffe,
 	} {
-		t.Run(fmt.Sprintf("%04x", op), func(t *testing.T) {
-			m := newMachineWithROM(t, []byte{byte(op >> 8), byte(op)})
-			ok, err := stepNoPanic(t, m)
-			if !ok {
-				return
-			}
-			wantErrContaining(t, err, fmt.Sprintf("%04x", op))
-		})
-	}
-}
-
-// TEMPORARY: 8XY6, 8XY7 and 8XYE are valid CHIP-8 instructions that are not
-// implemented yet. When one is implemented, delete its entry here and write real
-// tests for it, including the quirks that affect it (shifts use VY on the
-// original hardware).
-func TestNotYetImplemented8XYn(t *testing.T) {
-	for _, op := range []uint16{0x8016, 0x8017, 0x801e} {
 		t.Run(fmt.Sprintf("%04x", op), func(t *testing.T) {
 			m := newMachineWithROM(t, []byte{byte(op >> 8), byte(op)})
 			ok, err := stepNoPanic(t, m)
@@ -929,5 +917,637 @@ func TestSkipLandsAtEndOfMemory(t *testing.T) {
 	ok, err := stepNoPanic(t, m)
 	if ok {
 		wantErrContaining(t, err, "memory")
+	}
+}
+
+// 8XY7 sets VX = VY - VX, and VF to 1 when there is NO borrow (VY >= VX).
+func TestReverseSubVxVy(t *testing.T) {
+	tests := []struct {
+		a, b     byte // VX, VY
+		want     byte
+		noBorrow byte
+	}{
+		{3, 5, 2, 1},
+		{5, 3, 0xfe, 0},
+		{5, 5, 0, 1}, // equal does not borrow
+		{0, 0, 0, 1},
+		{0, 0xff, 0xff, 1},
+		{1, 0, 0xff, 0},
+		{0xff, 0, 0x01, 0},
+		{0x7f, 0x80, 0x01, 1},
+		{0x80, 0x7f, 0xff, 0},
+	}
+	for _, tt := range tests {
+		t.Run(fmt.Sprintf("%02x-%02x", tt.b, tt.a), func(t *testing.T) {
+			m := run8(t, 0x7, 3, 4, tt.a, tt.b)
+			if m.regV[3] != tt.want {
+				t.Errorf("V3 = %02x, want %02x", m.regV[3], tt.want)
+			}
+			if m.regV[0xf] != tt.noBorrow {
+				t.Errorf("VF = %02x, want %02x", m.regV[0xf], tt.noBorrow)
+			}
+			if m.regV[4] != tt.b {
+				t.Errorf("V4 = %02x, want it unchanged at %02x", m.regV[4], tt.b)
+			}
+		})
+	}
+}
+
+func TestReverseSubWithVF(t *testing.T) {
+	t.Run("X is VF, the flag wins", func(t *testing.T) {
+		m := run8(t, 0x7, 0xf, 1, 0x03, 0x05) // VF = 05 - 03 = 02, no borrow
+		if m.regV[0xf] != 1 {
+			t.Errorf("VF = %02x, want 01 (the flag, not the difference)", m.regV[0xf])
+		}
+	})
+	t.Run("X is VF, borrow", func(t *testing.T) {
+		m := run8(t, 0x7, 0xf, 1, 0x05, 0x03) // VF = 03 - 05 = fe, borrow
+		if m.regV[0xf] != 0 {
+			t.Errorf("VF = %02x, want 00 (the flag, not the difference)", m.regV[0xf])
+		}
+	})
+	t.Run("Y is VF", func(t *testing.T) {
+		m := run8(t, 0x7, 0, 0xf, 0x03, 0x05) // V0 = VF(05) - 03 = 02, no borrow
+		if m.regV[0] != 0x02 || m.regV[0xf] != 1 {
+			t.Errorf("V0 = %02x, VF = %02x; want 02 and 01", m.regV[0], m.regV[0xf])
+		}
+	})
+	t.Run("Y is VF, borrow", func(t *testing.T) {
+		m := run8(t, 0x7, 0, 0xf, 0x05, 0x03) // V0 = VF(03) - 05 = fe, borrow
+		if m.regV[0] != 0xfe || m.regV[0xf] != 0 {
+			t.Errorf("V0 = %02x, VF = %02x; want fe and 00", m.regV[0], m.regV[0xf])
+		}
+	})
+	t.Run("both VF", func(t *testing.T) {
+		m := run8(t, 0x7, 0xf, 0xf, 0x37, 0x37) // x - x = 0, no borrow
+		if m.regV[0xf] != 1 {
+			t.Errorf("VF = %02x, want 01", m.regV[0xf])
+		}
+	})
+	t.Run("same register", func(t *testing.T) {
+		m := run8(t, 0x7, 2, 2, 0x80, 0x80)
+		if m.regV[2] != 0 || m.regV[0xf] != 1 {
+			t.Errorf("V2 = %02x, VF = %02x; want 00 and 01", m.regV[2], m.regV[0xf])
+		}
+	})
+}
+
+// The shifts below are the original COSMAC VIP behaviour: 8XY6 and 8XYE shift VY
+// and store the result in VX (VX's old value is ignored). Later interpreters
+// shift VX in place instead; when a quirks setting for that exists these tests
+// become the VIP preset.
+
+// 8XY6 sets VX = VY >> 1, and VF to the bit that was shifted out.
+func TestShiftRightVxVy(t *testing.T) {
+	tests := []struct {
+		vy   byte
+		want byte
+		vf   byte
+	}{
+		{0b0000_0101, 0b0000_0010, 1},
+		{0b0000_0100, 0b0000_0010, 0},
+		{0xff, 0x7f, 1},
+		{0x01, 0x00, 1},
+		{0x00, 0x00, 0},
+		{0x80, 0x40, 0}, // the high bit moves down and is not the flag
+		{0xfe, 0x7f, 0},
+	}
+	for _, tt := range tests {
+		t.Run(fmt.Sprintf("%08b", tt.vy), func(t *testing.T) {
+			// VX starts at ff so that using it as the source would show
+			m := run8(t, 0x6, 3, 4, 0xff, tt.vy)
+			if m.regV[3] != tt.want {
+				t.Errorf("V3 = %02x, want %02x", m.regV[3], tt.want)
+			}
+			if m.regV[0xf] != tt.vf {
+				t.Errorf("VF = %02x, want %02x", m.regV[0xf], tt.vf)
+			}
+			if m.regV[4] != tt.vy {
+				t.Errorf("V4 = %02x, want VY left unchanged at %02x", m.regV[4], tt.vy)
+			}
+		})
+	}
+}
+
+// 8XYE sets VX = VY << 1, and VF to the bit that was shifted out (0 or 1).
+func TestShiftLeftVxVy(t *testing.T) {
+	tests := []struct {
+		vy   byte
+		want byte
+		vf   byte
+	}{
+		{0b1000_0001, 0b0000_0010, 1},
+		{0b0100_0001, 0b1000_0010, 0},
+		{0xff, 0xfe, 1},
+		{0x80, 0x00, 1},
+		{0x00, 0x00, 0},
+		{0x01, 0x02, 0}, // the low bit moves up and is not the flag
+		{0x7f, 0xfe, 0},
+	}
+	for _, tt := range tests {
+		t.Run(fmt.Sprintf("%08b", tt.vy), func(t *testing.T) {
+			m := run8(t, 0xe, 3, 4, 0xff, tt.vy)
+			if m.regV[3] != tt.want {
+				t.Errorf("V3 = %02x, want %02x", m.regV[3], tt.want)
+			}
+			if m.regV[0xf] != tt.vf {
+				t.Errorf("VF = %02x, want %02x (exactly 0 or 1)", m.regV[0xf], tt.vf)
+			}
+			if m.regV[4] != tt.vy {
+				t.Errorf("V4 = %02x, want VY left unchanged at %02x", m.regV[4], tt.vy)
+			}
+		})
+	}
+}
+
+func TestShiftWithVF(t *testing.T) {
+	tests := []struct {
+		name   string
+		n      byte
+		x, y   byte
+		a, b   byte
+		wantX  byte // expected value of VX, if X is not VF
+		wantVF byte
+	}{
+		// X is VF: the flag is written after the result, so it wins
+		{"right, X is VF", 0x6, 0xf, 1, 0x00, 0x05, 0, 1},         // result 02, flag 1
+		{"right, X is VF, flag 0", 0x6, 0xf, 1, 0x00, 0x06, 0, 0}, // result 03, flag 0
+		{"left, X is VF", 0xe, 0xf, 1, 0x00, 0x81, 0, 1},          // result 02, flag 1
+		{"left, X is VF, flag 0", 0xe, 0xf, 1, 0x00, 0x41, 0, 0},  // result 82, flag 0
+		// Y is VF: its old value is the source
+		{"right, Y is VF", 0x6, 3, 0xf, 0xff, 0x05, 0x02, 1},
+		{"left, Y is VF", 0xe, 3, 0xf, 0xff, 0x81, 0x02, 1},
+		// both VF: VF = VF shifted, then the flag
+		{"right, both VF", 0x6, 0xf, 0xf, 0x05, 0x05, 0, 1},
+		{"left, both VF", 0xe, 0xf, 0xf, 0x81, 0x81, 0, 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := run8(t, tt.n, tt.x, tt.y, tt.a, tt.b)
+			if m.regV[0xf] != tt.wantVF {
+				t.Errorf("VF = %02x, want %02x", m.regV[0xf], tt.wantVF)
+			}
+			if tt.x != 0xf && m.regV[tt.x] != tt.wantX {
+				t.Errorf("V%x = %02x, want %02x", tt.x, m.regV[tt.x], tt.wantX)
+			}
+			if tt.y != 0xf && tt.y != tt.x && m.regV[tt.y] != tt.b {
+				t.Errorf("V%x = %02x, want VY left unchanged at %02x", tt.y, m.regV[tt.y], tt.b)
+			}
+		})
+	}
+}
+
+// With the same register on both sides the shift works in place.
+func TestShiftSameRegister(t *testing.T) {
+	m := run8(t, 0x6, 2, 2, 0x0b, 0x0b)
+	if m.regV[2] != 0x05 || m.regV[0xf] != 1 {
+		t.Errorf(">>: V2 = %02x, VF = %02x; want 05 and 01", m.regV[2], m.regV[0xf])
+	}
+	m = run8(t, 0xe, 2, 2, 0xc1, 0xc1)
+	if m.regV[2] != 0x82 || m.regV[0xf] != 1 {
+		t.Errorf("<<: V2 = %02x, VF = %02x; want 82 and 01", m.regV[2], m.regV[0xf])
+	}
+}
+
+// BNNN jumps to NNN + V0. (Some later interpreters use VX, where X is the high
+// nibble of NNN; the original uses V0.)
+func TestJumpV0(t *testing.T) {
+	tests := []struct {
+		name string
+		v0   byte
+		nnn  uint16
+		want uint16
+	}{
+		{"V0 is zero", 0x00, 0x300, 0x300},
+		{"small offset", 0x10, 0x300, 0x310},
+		{"largest offset", 0xff, 0x200, 0x2ff},
+		{"carries into the next nibble", 0x20, 0x3f0, 0x410},
+		{"lowest address", 0x00, 0x000, 0x000},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// LD V0, v0; JP V0, nnn
+			m := newMachineWithROM(t, []byte{0x60, tt.v0, 0xb0 | byte(tt.nnn>>8), byte(tt.nnn)})
+			step(t, m)
+			step(t, m)
+			if m.pc != tt.want {
+				t.Errorf("pc = %04x, want %04x", m.pc, tt.want)
+			}
+			if m.sp != 0 {
+				t.Errorf("sp = %d, a jump must not push a return address", m.sp)
+			}
+			if m.regV[0] != tt.v0 {
+				t.Errorf("V0 = %02x, want it unchanged at %02x", m.regV[0], tt.v0)
+			}
+		})
+	}
+}
+
+// The offset is always V0, not the register named by the high nibble of NNN.
+func TestJumpV0IgnoresOtherRegisters(t *testing.T) {
+	// LD V0, 10; LD V3, 40; JP V0, 305
+	m := newMachineWithROM(t, []byte{0x60, 0x10, 0x63, 0x40, 0xb3, 0x05})
+	for range 3 {
+		step(t, m)
+	}
+	if m.pc != 0x315 {
+		t.Errorf("pc = %04x, want 0315 (V0 = 10 is the offset, not V3 = 40)", m.pc)
+	}
+}
+
+// NNN + V0 can exceed the end of memory. The address is not wrapped to 12 bits:
+// the jump itself succeeds, and it is the next fetch that fails.
+func TestJumpV0PastEndOfMemory(t *testing.T) {
+	// LD V0, ff; JP V0, fff
+	m := newMachineWithROM(t, []byte{0x60, 0xff, 0xbf, 0xff})
+	step(t, m)
+	if ok, err := stepNoPanic(t, m); !ok || err != nil {
+		t.Fatalf("the jump itself returned %v (panicked: %v)", err, !ok)
+	}
+	if m.pc != 0x10fe {
+		t.Errorf("pc = %04x, want 10fe (fff + ff, not wrapped)", m.pc)
+	}
+	ok, err := stepNoPanic(t, m)
+	if ok {
+		wantErrContaining(t, err, "memory")
+	}
+}
+
+// A jump to exactly the end of memory behaves the same way.
+func TestJumpV0ToEndOfMemory(t *testing.T) {
+	// LD V0, 01; JP V0, fff
+	m := newMachineWithROM(t, []byte{0x60, 0x01, 0xbf, 0xff})
+	step(t, m)
+	step(t, m)
+	if m.pc != MemSize {
+		t.Errorf("pc = %04x, want %04x", m.pc, MemSize)
+	}
+	ok, err := stepNoPanic(t, m)
+	if ok {
+		wantErrContaining(t, err, "memory")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// FX1E, FX33, FX55, FX65
+// ---------------------------------------------------------------------------
+
+// runF runs a single FXnn instruction on a fresh machine, after setup has set
+// the machine's state, and returns the machine and the instruction's error.
+func runF(t *testing.T, x byte, nn byte, setup func(m *Machine)) (*Machine, error) {
+	t.Helper()
+	m := newMachineWithROM(t, []byte{0xf0 | x, nn})
+	if setup != nil {
+		setup(m)
+	}
+	ok, err := stepNoPanic(t, m)
+	if !ok {
+		t.FailNow()
+	}
+	return m, err
+}
+
+func TestAddIVx(t *testing.T) { // FX1E
+	cases := []struct {
+		name  string
+		x     byte
+		i     uint16
+		vx    uint8
+		wantI uint16
+	}{
+		{"simple", 3, 0x300, 0x10, 0x310},
+		{"zero", 3, 0x300, 0, 0x300},
+		{"from zero", 0, 0, 0xff, 0xff},
+		{"max reachable", 3, 0xf00, 0xff, 0xfff},
+		{"uses VF as the source", 0xf, 0x200, 0x07, 0x207},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m, err := runF(t, tc.x, 0x1e, func(m *Machine) {
+				m.regI = tc.i
+				m.regV[tc.x] = tc.vx
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if m.regI != tc.wantI {
+				t.Errorf("I = %03x, want %03x", m.regI, tc.wantI)
+			}
+			if m.regV[tc.x] != tc.vx {
+				t.Errorf("V%X = %02x, want it unchanged (%02x)", tc.x, m.regV[tc.x], tc.vx)
+			}
+		})
+	}
+}
+
+// FX1E must leave VF alone, both when it succeeds and when it fails. (Some
+// interpreters set VF when I overflows; this one reports an error instead.)
+func TestAddIVxLeavesVF(t *testing.T) {
+	cases := []struct {
+		name    string
+		i       uint16
+		vx      uint8
+		wantErr bool
+	}{
+		{"success", 0xf00, 0xff, false},
+		{"failure", 0xf01, 0xff, true}, // would reach 0x1000
+	}
+	for _, tc := range cases {
+		for _, vf := range []uint8{0, 1, 0x55} {
+			t.Run(fmt.Sprintf("%s/VF=%02x", tc.name, vf), func(t *testing.T) {
+				m, err := runF(t, 1, 0x1e, func(m *Machine) {
+					m.regI = tc.i
+					m.regV[1] = tc.vx
+					m.regV[0xf] = vf
+				})
+				if (err != nil) != tc.wantErr {
+					t.Fatalf("error = %v, want error: %v", err, tc.wantErr)
+				}
+				if m.regV[0xf] != vf {
+					t.Errorf("VF = %02x, want it unchanged (%02x)", m.regV[0xf], vf)
+				}
+			})
+		}
+	}
+}
+
+// I may not be advanced past the last valid address (0xfff). That includes
+// landing exactly on 0x1000, which is not an address, as well as going far past.
+func TestAddIVxPastEndOfMemory(t *testing.T) {
+	cases := []struct {
+		name string
+		i    uint16
+		vx   uint8
+	}{
+		{"exactly one past the end", 0xf01, 0xff},
+		{"exactly one past the end from the last address", 0xfff, 0x01},
+		{"well past the end", 0xfff, 0x10},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m, err := runF(t, 1, 0x1e, func(m *Machine) {
+				m.regI = tc.i
+				m.regV[1] = tc.vx
+			})
+			wantErrContaining(t, err, "past end of memory")
+			if m.regI != tc.i {
+				t.Errorf("I = %03x after a failed FX1E, want it unchanged (%03x)", m.regI, tc.i)
+			}
+		})
+	}
+}
+
+func TestBCD(t *testing.T) { // FX33
+	cases := []struct {
+		v          uint8
+		h, tn, one byte
+	}{
+		{0, 0, 0, 0},
+		{5, 0, 0, 5},
+		{9, 0, 0, 9},
+		{10, 0, 1, 0},
+		{99, 0, 9, 9},
+		{100, 1, 0, 0},
+		{101, 1, 0, 1},
+		{123, 1, 2, 3},
+		{200, 2, 0, 0},
+		{254, 2, 5, 4},
+		{255, 2, 5, 5},
+	}
+	for _, tc := range cases {
+		t.Run(fmt.Sprint(tc.v), func(t *testing.T) {
+			m, err := runF(t, 4, 0x33, func(m *Machine) {
+				m.regI = 0x400
+				m.regV[4] = tc.v
+				// Sentinels around the target, to catch writes outside it
+				m.mem[0x3ff] = 0xaa
+				m.mem[0x403] = 0xbb
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := [3]byte{m.mem[0x400], m.mem[0x401], m.mem[0x402]}
+			if want := [3]byte{tc.h, tc.tn, tc.one}; got != want {
+				t.Errorf("BCD of %d = %v, want %v", tc.v, got, want)
+			}
+			if m.mem[0x3ff] != 0xaa || m.mem[0x403] != 0xbb {
+				t.Errorf("wrote outside I..I+2: %02x, %02x", m.mem[0x3ff], m.mem[0x403])
+			}
+			if m.regI != 0x400 {
+				t.Errorf("I = %03x, want it unchanged (0x400)", m.regI)
+			}
+			if m.regV[4] != tc.v {
+				t.Errorf("V4 = %d, want it unchanged (%d)", m.regV[4], tc.v)
+			}
+		})
+	}
+}
+
+func TestBCDWithVFAsSource(t *testing.T) {
+	m, err := runF(t, 0xf, 0x33, func(m *Machine) {
+		m.regI = 0x400
+		m.regV[0xf] = 145
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := [3]byte{m.mem[0x400], m.mem[0x401], m.mem[0x402]}, [3]byte{1, 4, 5}; got != want {
+		t.Errorf("BCD of VF = %v, want %v", got, want)
+	}
+}
+
+func TestBCDAtEndOfMemory(t *testing.T) {
+	// The last valid place to write three bytes
+	m, err := runF(t, 0, 0x33, func(m *Machine) {
+		m.regI = MemSize - 3
+		m.regV[0] = 123
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := [3]byte{m.mem[MemSize-3], m.mem[MemSize-2], m.mem[MemSize-1]}, [3]byte{1, 2, 3}; got != want {
+		t.Errorf("BCD at the end of memory = %v, want %v", got, want)
+	}
+
+	// One byte too far: must be an error, not a panic or a partial write
+	m, err = runF(t, 0, 0x33, func(m *Machine) {
+		m.regI = MemSize - 2
+		m.regV[0] = 123
+	})
+	wantErrContaining(t, err, "past end of memory")
+	if m.mem[MemSize-2] != 0 || m.mem[MemSize-1] != 0 {
+		t.Errorf("partial write after a failed FX33: %02x %02x", m.mem[MemSize-2], m.mem[MemSize-1])
+	}
+}
+
+func TestStoreRegisters(t *testing.T) { // FX55
+	// Registers hold distinct non-zero values, so a wrong index shows up
+	setRegs := func(m *Machine) {
+		for i := range m.regV {
+			m.regV[i] = uint8(0x10 + i)
+		}
+	}
+	for _, x := range []byte{0, 1, 7, 0xe, 0xf} {
+		t.Run(fmt.Sprintf("V0-V%X", x), func(t *testing.T) {
+			m, err := runF(t, x, 0x55, func(m *Machine) {
+				setRegs(m)
+				m.regI = 0x400
+				m.mem[0x3ff] = 0xaa
+				m.mem[0x400+int(x)+1] = 0xbb // first byte past the range
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			for i := 0; i <= int(x); i++ {
+				if got, want := m.mem[0x400+i], uint8(0x10+i); got != want {
+					t.Errorf("mem[%03x] = %02x, want %02x (V%X)", 0x400+i, got, want, i)
+				}
+			}
+			if m.mem[0x3ff] != 0xaa {
+				t.Errorf("wrote before I: %02x", m.mem[0x3ff])
+			}
+			if m.mem[0x400+int(x)+1] != 0xbb {
+				t.Errorf("wrote past Vx (%02x): register count is off by one", m.mem[0x400+int(x)+1])
+			}
+			if want := uint16(0x400 + int(x) + 1); m.regI != want {
+				t.Errorf("I = %03x, want %03x (I + x + 1)", m.regI, want)
+			}
+			for i := range m.regV {
+				if m.regV[i] != uint8(0x10+i) {
+					t.Errorf("V%X = %02x, want it unchanged", i, m.regV[i])
+				}
+			}
+		})
+	}
+}
+
+func TestStoreRegistersBounds(t *testing.T) {
+	setRegs := func(m *Machine) {
+		for i := range m.regV {
+			m.regV[i] = 0x80 + uint8(i)
+		}
+	}
+	t.Run("last valid address", func(t *testing.T) {
+		// V0-VF into the final 16 bytes of memory
+		m, err := runF(t, 0xf, 0x55, func(m *Machine) {
+			setRegs(m)
+			m.regI = MemSize - 16
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, want := m.mem[MemSize-1], uint8(0x8f); got != want {
+			t.Errorf("last byte of memory = %02x, want %02x", got, want)
+		}
+		if m.regI != MemSize {
+			t.Errorf("I = %03x, want %03x", m.regI, MemSize)
+		}
+	})
+	t.Run("one byte too far", func(t *testing.T) {
+		m, err := runF(t, 0xf, 0x55, func(m *Machine) {
+			setRegs(m)
+			m.regI = MemSize - 15
+		})
+		wantErrContaining(t, err, "past end of memory")
+		if m.regI != MemSize-15 {
+			t.Errorf("I = %03x after a failed FX55, want it unchanged", m.regI)
+		}
+		for i := MemSize - 15; i < MemSize; i++ {
+			if m.mem[i] != 0 {
+				t.Fatalf("partial write after a failed FX55: mem[%03x] = %02x", i, m.mem[i])
+			}
+		}
+	})
+}
+
+func TestLoadRegisters(t *testing.T) { // FX65
+	fillMem := func(m *Machine) {
+		for i := range 16 {
+			m.mem[0x400+i] = uint8(0x40 + i)
+		}
+	}
+	for _, x := range []byte{0, 1, 7, 0xe, 0xf} {
+		t.Run(fmt.Sprintf("V0-V%X", x), func(t *testing.T) {
+			m, err := runF(t, x, 0x65, func(m *Machine) {
+				fillMem(m)
+				m.regI = 0x400
+				for i := range m.regV {
+					m.regV[i] = 0xee
+				}
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			for i := range m.regV {
+				want := uint8(0xee) // beyond Vx: untouched
+				if i <= int(x) {
+					want = uint8(0x40 + i)
+				}
+				if m.regV[i] != want {
+					t.Errorf("V%X = %02x, want %02x", i, m.regV[i], want)
+				}
+			}
+			if want := uint16(0x400 + int(x) + 1); m.regI != want {
+				t.Errorf("I = %03x, want %03x (I + x + 1)", m.regI, want)
+			}
+			for i := range 16 {
+				if m.mem[0x400+i] != uint8(0x40+i) {
+					t.Errorf("mem[%03x] changed to %02x", 0x400+i, m.mem[0x400+i])
+				}
+			}
+		})
+	}
+}
+
+func TestLoadRegistersBounds(t *testing.T) {
+	t.Run("last valid address", func(t *testing.T) {
+		m, err := runF(t, 0xf, 0x65, func(m *Machine) {
+			m.regI = MemSize - 16
+			m.mem[MemSize-1] = 0x99
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if m.regV[0xf] != 0x99 {
+			t.Errorf("VF = %02x, want 99 (the last byte of memory)", m.regV[0xf])
+		}
+		if m.regI != MemSize {
+			t.Errorf("I = %03x, want %03x", m.regI, MemSize)
+		}
+	})
+	t.Run("one byte too far", func(t *testing.T) {
+		m, err := runF(t, 0xf, 0x65, func(m *Machine) {
+			m.regI = MemSize - 15
+			m.regV[0] = 0x77
+		})
+		wantErrContaining(t, err, "past end of memory")
+		if m.regI != MemSize-15 {
+			t.Errorf("I = %03x after a failed FX65, want it unchanged", m.regI)
+		}
+		if m.regV[0] != 0x77 {
+			t.Errorf("V0 = %02x after a failed FX65, want it unchanged", m.regV[0])
+		}
+	})
+}
+
+// A store followed by a load through the same I round-trips every register.
+func TestStoreLoadRoundTrip(t *testing.T) {
+	m := newMachineWithROM(t, []byte{
+		0xa4, 0x00, // LD I, 0x400
+		0xff, 0x55, // LD [I], VF
+		0xa4, 0x00, // LD I, 0x400
+		0xff, 0x65, // LD VF, [I]
+	})
+	for i := range m.regV {
+		m.regV[i] = uint8(i*17 + 3)
+	}
+	want := m.regV
+	step(t, m)
+	step(t, m)
+	m.regV = [16]uint8{}
+	step(t, m)
+	step(t, m)
+	if m.regV != want {
+		t.Errorf("registers after round trip = %v, want %v", m.regV, want)
 	}
 }
