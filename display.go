@@ -39,18 +39,29 @@ func (d *DummyDisplay) IsSet(x uint8, y uint8) bool {
 
 func (d *DummyDisplay) DrawSprite(x uint8, y uint8, sprite []byte) bool {
 	ret := false
+	// Wrap start position for screen size
+	x = x % d.sizeX
+	y = y % d.sizeY
 	var pixel byte
 	var tmpX uint8
 	var tmpY uint8
 	for i := range len(sprite) {
 		tmp := sprite[i]
 		tmpY = y + uint8(i)
+		// Truncate past end of screen
+		if tmpY >= d.sizeY {
+			continue
+		}
 		for j := range 8 {
 			pixel = min(tmp&(0x80>>j), 1)
 			if pixel == 0 {
 				continue
 			}
 			tmpX = x + uint8(j)
+			// Truncate past end of screen
+			if tmpX >= d.sizeX {
+				continue
+			}
 			if d.data[tmpX][tmpY] > 0 {
 				// Flip the pixel and set the collision flag
 				pixel = 0

@@ -172,3 +172,165 @@ func TestDrawZeroHeight(t *testing.T) {
 		t.Errorf("VF = %d, want 0", m.regV[0xf])
 	}
 }
+
+// DXYN reads N bytes starting at I, so the last legal sprite ends exactly at the
+// end of memory, and anything beyond that must be an error rather than a panic.
+func TestDrawSpriteMemoryBounds(t *testing.T) {
+	tests := []struct {
+		name    string
+		i       uint16
+		n       byte
+		wantErr bool
+		wantLit int // pixels lit when there is no error
+	}{
+		{"last byte of memory", 0xfff, 1, false, 1},
+		{"one byte past the end", 0xfff, 2, true, 0},
+		{"ends exactly at end of memory", 0xff1, 15, false, 1},
+		{"one byte past the end, max height", 0xff2, 15, true, 0},
+		{"far past the end", 0xfff, 15, true, 0},
+		{"zero height at last address", 0xfff, 0, false, 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// LD VF, 1; LD I, i; DRW V0, V0, n
+			m := newMachineWithROM(t, []byte{
+				0x6f, 0x01,
+				0xa0 | byte(tt.i>>8), byte(tt.i),
+				0xd0, tt.n,
+			})
+			m.mem[MemSize-1] = 0x80 // the last byte of memory is a one-pixel sprite
+			step(t, m)
+			step(t, m)
+			pcBefore := m.pc
+			ok, err := stepNoPanic(t, m)
+			if !ok {
+				return
+			}
+			// Like every other instruction, DXYN is consumed whether or not it
+			// succeeds: the program counter has moved on.
+			if m.pc != pcBefore+InstructionSize {
+				t.Errorf("pc = %04x, want %04x", m.pc, pcBefore+InstructionSize)
+			}
+			if tt.wantErr {
+				wantErrContaining(t, err, "memory")
+				if n := litPixels(m.disp); n != 0 {
+					t.Errorf("%d pixels drawn despite the error", n)
+				}
+				if m.regV[0xf] != 1 {
+					t.Errorf("VF = %d after the error, want it left at 1", m.regV[0xf])
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %s", err)
+			}
+			if n := litPixels(m.disp); n != tt.wantLit {
+				t.Errorf("%d pixels lit, want %d", n, tt.wantLit)
+			}
+			if m.regV[0xf] != 0 {
+				t.Errorf("VF = %d, want 0 (nothing to collide with)", m.regV[0xf])
+			}
+		})
+	}
+}
+
+// A sprite that starts at the last byte of memory must read that byte, not
+// something else.
+func TestDrawSpriteReadsLastByteOfMemory(t *testing.T) {
+	// LD I, fff; DRW V0, V0, 1
+	m := newMachineWithROM(t, []byte{0xaf, 0xff, 0xd0, 0x01})
+	m.mem[MemSize-1] = 0b10100000
+	step(t, m)
+	step(t, m)
+	if got, want := rowString(m.disp, 0)[:4], "#.#."; got != want {
+		t.Errorf("row 0 = %q, want %q", got, want)
+	}
+}
+
+// The sprite is read from wherever I points, including the program itself, not
+// just the font.
+func TestDrawSpriteReadsFromI(t *testing.T) {
+	// LD I, 0x200; DRW V0, V0, 2 -- draws the program's own first two bytes
+	m := newMachineWithROM(t, []byte{0xa2, 0x00, 0xd0, 0x02})
+	step(t, m)
+	step(t, m)
+	if got, want := rowString(m.disp, 0)[:8], "#.#...#."; got != want { // 0xa2
+		t.Errorf("row 0 = %q, want %q", got, want)
+	}
+	if got, want := rowString(m.disp, 1)[:8], "........"; got != want { // 0x00
+		t.Errorf("row 1 = %q, want %q", got, want)
+	}
+}
+
+// Drawing through the machine near the edge must clip and not fail.
+func TestDrawSpriteNearEdgeThroughMachine(t *testing.T) {
+	// LD V0, 60; LD V1, 30; LD I, font "0"; DRW V0, V1, 5
+	m := newMachineWithROM(t, []byte{0x60, 60, 0x61, 30, 0xa0, 0x50, 0xd0, 0x15})
+	for range 3 {
+		step(t, m)
+	}
+	if ok, err := stepNoPanic(t, m); ok && err != nil {
+		t.Fatalf("DRW near the edge returned an error: %s", err)
+	}
+	// Glyph "0" rows 0 and 1 (f0, 90) land on screen rows 30 and 31
+	if got, want := rowString(m.disp, 30)[56:], "....####"; got != want {
+		t.Errorf("row 30 = %q, want %q", got, want)
+	}
+	if got, want := rowString(m.disp, 31)[56:], "....#..#"; got != want {
+		t.Errorf("row 31 = %q, want %q", got, want)
+	}
+	if n := litPixels(m.disp); n != 6 {
+		t.Errorf("%d pixels lit, want 6", n)
+	}
+}
+
+// DXYN wraps the start position from VX and VY around the display.
+func TestDrawSpriteStartPositionWrapsThroughMachine(t *testing.T) {
+	// LD V0, 66; LD V1, 33; LD I, font "0"; DRW V0, V1, 5
+	m := newMachineWithROM(t, []byte{0x60, 66, 0x61, 33, 0xa0, 0x50, 0xd0, 0x15})
+	for range 4 {
+		step(t, m)
+	}
+	// (66,33) wraps to (2,1); glyph "0" is "####" over "#..#" x3 over "####"
+	for y, want := range []string{"####", "#..#", "#..#", "#..#", "####"} {
+		if got := rowString(m.disp, uint8(1+y))[2:6]; got != want {
+			t.Errorf("row %d = %q, want %q", 1+y, got, want)
+		}
+	}
+	if n := litPixels(m.disp); n != 14 {
+		t.Errorf("%d pixels lit, want 14", n)
+	}
+}
+
+// Pixels that are clipped off the edge take no part in collision detection: they
+// must neither collide with pixels on the opposite edge (as they would if they
+// wrapped) nor hide a collision on the visible part.
+func TestDrawSpriteClippingAndVF(t *testing.T) {
+	m := newMachineWithROM(t, []byte{
+		0x60, 0, 0x61, 30, // LD V0, 0; LD V1, 30
+		0xa0, 0x50, // LD I, font "0"
+		0xd0, 0x15, // DRW V0, V1, 5: lights columns 0-3 of rows 30 and 31 (the rest is off the bottom)
+		0x60, 62, // LD V0, 62
+		0xd0, 0x15, // DRW V0, V1, 5: columns 62-63 visible, 64-67 clipped (they would wrap onto columns 0-3)
+		0xd0, 0x15, // DRW again: erases it, colliding on the visible pixels only
+	})
+	for range 4 {
+		step(t, m)
+	}
+	step(t, m) // LD V0, 62
+	step(t, m) // the clipped draw
+	if m.regV[0xf] != 0 {
+		t.Errorf("VF = 1 after drawing a sprite whose clipped part overlaps the opposite edge")
+	}
+	// 6 from the first draw, and 3 visible pixels (2 in row 30, 1 in row 31)
+	if n := litPixels(m.disp); n != 9 {
+		t.Errorf("%d pixels lit, want 9\n%s", n, renderDisplay(m.disp))
+	}
+	step(t, m)
+	if m.regV[0xf] != 1 {
+		t.Errorf("VF = 0 when redrawing over the visible pixels, want 1")
+	}
+	if n := litPixels(m.disp); n != 6 {
+		t.Errorf("%d pixels lit, want 6", n)
+	}
+}
