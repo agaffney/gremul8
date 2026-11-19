@@ -154,6 +154,9 @@ func (m *Machine) evalInstrD(instr instruction) error {
 	regX := instr.nibble(1)
 	regY := instr.nibble(2)
 	size := instr.nibble(3)
+	if m.regI+uint16(size) > MemSize {
+		return errors.New("read past end of memory")
+	}
 	sprite := m.mem[m.regI : m.regI+uint16(size)]
 	if m.disp.DrawSprite(m.regV[regX], m.regV[regY], sprite) {
 		// Set VF to 1 on collision
