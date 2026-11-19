@@ -98,8 +98,12 @@ func (m *Machine) evalInstr(instr instruction) error {
 		return m.evalInstr9(instr)
 	case 0xa:
 		return m.evalInstrA(instr)
+	case 0xb:
+		return m.evalInstrB(instr)
 	case 0xd:
 		return m.evalInstrD(instr)
+	case 0xf:
+		return m.evalInstrF(instr)
 	default:
 		return fmt.Errorf("unknown instruction: %04x", instr.all())
 	}
@@ -214,6 +218,23 @@ func (m *Machine) evalInstr8(instr instruction) error {
 		if underflow {
 			m.regV[0xf] = 0
 		}
+	case 0x6:
+		m.regV[regX] = m.regV[regY]
+		shiftedBit := m.regV[regX] & 0x01
+		m.regV[regX] = m.regV[regX] >> 1
+		m.regV[0xf] = shiftedBit
+	case 0x7:
+		underflow := m.regV[regX] > m.regV[regY]
+		m.regV[regX] = m.regV[regY] - m.regV[regX]
+		m.regV[0xf] = 1
+		if underflow {
+			m.regV[0xf] = 0
+		}
+	case 0xe:
+		m.regV[regX] = m.regV[regY]
+		shiftedBit := m.regV[regX] & 0x80
+		m.regV[regX] = m.regV[regX] << 1
+		m.regV[0xf] = shiftedBit >> 7
 	default:
 		return fmt.Errorf("unknown instruction: %04x", instr.all())
 	}
@@ -239,6 +260,11 @@ func (m *Machine) evalInstrA(instr instruction) error {
 	return nil
 }
 
+func (m *Machine) evalInstrB(instr instruction) error {
+	m.pc = instr.address() + uint16(m.regV[0x0])
+	return nil
+}
+
 func (m *Machine) evalInstrD(instr instruction) error {
 	regX := instr.nibble(1)
 	regY := instr.nibble(2)
@@ -253,6 +279,47 @@ func (m *Machine) evalInstrD(instr instruction) error {
 	} else {
 		// Reset VF
 		m.regV[0xf] = 0
+	}
+	return nil
+}
+
+func (m *Machine) evalInstrF(instr instruction) error {
+	regX := instr.nibble(1)
+	switch instr.lower() {
+	case 0x1e:
+		if m.regI+uint16(m.regV[regX]) >= MemSize {
+			return errors.New("set I past end of memory")
+		}
+		m.regI += uint16(m.regV[regX])
+	case 0x33:
+		if m.regI+3 > MemSize {
+			return errors.New("write past end of memory")
+		}
+		val := m.regV[regX]
+		dig1 := uint8(val / 100)
+		dig2 := uint8((val - (dig1 * 100)) / 10)
+		dig3 := uint8((val - (dig1 * 100) - (dig2 * 10)))
+		m.mem[m.regI] = dig1
+		m.mem[m.regI+1] = dig2
+		m.mem[m.regI+2] = dig3
+	case 0x55:
+		if m.regI+uint16(regX) >= MemSize {
+			return errors.New("write past end of memory")
+		}
+		for i := range regX + 1 {
+			m.mem[m.regI+uint16(i)] = m.regV[i]
+		}
+		m.regI += uint16(regX) + 1
+	case 0x65:
+		if m.regI+uint16(regX) >= MemSize {
+			return errors.New("read past end of memory")
+		}
+		for i := range regX + 1 {
+			m.regV[i] = m.mem[m.regI+uint16(i)]
+		}
+		m.regI += uint16(regX) + 1
+	default:
+		return fmt.Errorf("unknown instruction: %04x", instr.all())
 	}
 	return nil
 }
