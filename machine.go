@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 )
 
 const (
@@ -81,10 +82,20 @@ func (m *Machine) evalInstr(instr instruction) error {
 		return m.evalInstr1(instr)
 	case 0x2:
 		return m.evalInstr2(instr)
+	case 0x3:
+		return m.evalInstr3(instr)
+	case 0x4:
+		return m.evalInstr4(instr)
+	case 0x5:
+		return m.evalInstr5(instr)
 	case 0x6:
 		return m.evalInstr6(instr)
 	case 0x7:
 		return m.evalInstr7(instr)
+	case 0x8:
+		return m.evalInstr8(instr)
+	case 0x9:
+		return m.evalInstr9(instr)
 	case 0xa:
 		return m.evalInstrA(instr)
 	case 0xd:
@@ -131,6 +142,38 @@ func (m *Machine) evalInstr2(instr instruction) error {
 	return nil
 }
 
+func (m *Machine) evalInstr3(instr instruction) error {
+	regX := instr.nibble(1)
+	val := instr.lower()
+	if m.regV[regX] == val {
+		m.pc += InstructionSize
+	}
+	return nil
+}
+
+func (m *Machine) evalInstr4(instr instruction) error {
+	regX := instr.nibble(1)
+	val := instr.lower()
+	if m.regV[regX] != val {
+		m.pc += InstructionSize
+	}
+	return nil
+}
+
+func (m *Machine) evalInstr5(instr instruction) error {
+	switch instr.nibble(3) {
+	case 0x0:
+		regX := instr.nibble(1)
+		regY := instr.nibble(2)
+		if m.regV[regX] == m.regV[regY] {
+			m.pc += InstructionSize
+		}
+	default:
+		return fmt.Errorf("unknown instruction: %04x", instr.all())
+	}
+	return nil
+}
+
 func (m *Machine) evalInstr6(instr instruction) error {
 	vNum := instr.nibble(1)
 	val := instr.lower()
@@ -142,6 +185,52 @@ func (m *Machine) evalInstr7(instr instruction) error {
 	vNum := instr.nibble(1)
 	val := instr.lower()
 	m.regV[vNum] += val
+	return nil
+}
+
+func (m *Machine) evalInstr8(instr instruction) error {
+	regX := instr.nibble(1)
+	regY := instr.nibble(2)
+	switch instr.nibble(3) {
+	case 0x0:
+		m.regV[regX] = m.regV[regY]
+	case 0x1:
+		m.regV[regX] |= m.regV[regY]
+	case 0x2:
+		m.regV[regX] &= m.regV[regY]
+	case 0x3:
+		m.regV[regX] ^= m.regV[regY]
+	case 0x4:
+		overflow := (int(m.regV[regY]) + int(m.regV[regX])) > math.MaxUint8
+		m.regV[regX] += m.regV[regY]
+		m.regV[0xf] = 0
+		if overflow {
+			m.regV[0xf] = 1
+		}
+	case 0x5:
+		underflow := m.regV[regY] > m.regV[regX]
+		m.regV[regX] -= m.regV[regY]
+		m.regV[0xf] = 1
+		if underflow {
+			m.regV[0xf] = 0
+		}
+	default:
+		return fmt.Errorf("unknown instruction: %04x", instr.all())
+	}
+	return nil
+}
+
+func (m *Machine) evalInstr9(instr instruction) error {
+	switch instr.nibble(3) {
+	case 0x0:
+		regX := instr.nibble(1)
+		regY := instr.nibble(2)
+		if m.regV[regX] != m.regV[regY] {
+			m.pc += InstructionSize
+		}
+	default:
+		return fmt.Errorf("unknown instruction: %04x", instr.all())
+	}
 	return nil
 }
 
