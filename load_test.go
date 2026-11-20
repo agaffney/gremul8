@@ -26,7 +26,7 @@ func (d *recordingDisplay) DrawSprite(x, y uint8, data []byte) bool {
 
 func TestNewMachineUsesGivenDisplay(t *testing.T) {
 	d := &recordingDisplay{DummyDisplay: NewDummyDisplay(64, 32)}
-	m := NewMachine(d)
+	m := NewMachine(WithDisplay(d))
 	if d.clears == 0 {
 		t.Errorf("NewMachine did not clear the display it was given")
 	}
@@ -46,7 +46,7 @@ func TestNewMachineUsesGivenDisplay(t *testing.T) {
 
 func TestLoadClearsGivenDisplay(t *testing.T) {
 	d := &recordingDisplay{DummyDisplay: NewDummyDisplay(64, 32)}
-	m := NewMachine(d)
+	m := NewMachine(WithDisplay(d))
 	d.DrawSprite(0, 0, []byte{0xff})
 	before := d.clears
 	if err := m.Load(bytes.NewReader([]byte{0x12, 0x00})); err != nil {
@@ -61,7 +61,7 @@ func TestLoadClearsGivenDisplay(t *testing.T) {
 }
 
 func TestNewMachineNilDisplayDefaults(t *testing.T) {
-	m := NewMachine(nil)
+	m := NewMachine()
 	if m.disp == nil {
 		t.Fatalf("no display created")
 	}
@@ -71,7 +71,7 @@ func TestNewMachineNilDisplayDefaults(t *testing.T) {
 }
 
 func TestLoadReadError(t *testing.T) {
-	m := NewMachine(nil)
+	m := NewMachine()
 	boom := errors.New("boom")
 	if err := m.Load(iotest.ErrReader(boom)); !errors.Is(err, boom) {
 		t.Errorf("Load error = %v, want %v", err, boom)
@@ -79,7 +79,7 @@ func TestLoadReadError(t *testing.T) {
 }
 
 func TestLoadReadErrorAfterData(t *testing.T) {
-	m := NewMachine(nil)
+	m := NewMachine()
 	boom := errors.New("boom")
 	r := &errAfterReader{data: []byte{0x12, 0x00}, err: boom}
 	if err := m.Load(r); !errors.Is(err, boom) {

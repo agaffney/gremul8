@@ -24,12 +24,14 @@ type Machine struct {
 	sp   uint16
 }
 
-func NewMachine(d Display) *Machine {
+func NewMachine(opts ...Option) *Machine {
 	m := &Machine{
-		disp: d,
+		disp: NewDummyDisplay(64, 32),
 	}
-	if m.disp == nil {
-		m.disp = NewDummyDisplay(64, 32)
+	for _, opt := range opts {
+		if opt != nil {
+			opt(m)
+		}
 	}
 	m.reset()
 	return m

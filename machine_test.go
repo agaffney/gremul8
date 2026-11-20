@@ -290,7 +290,7 @@ func TestLoadSizeLimit(t *testing.T) {
 	rom := bytes.Repeat([]byte{0xaa}, maxSize)
 	rom[0], rom[maxSize-1] = 0x11, 0x22 // mark the first and last bytes
 
-	m := NewMachine(nil)
+	m := NewMachine()
 	if err := m.Load(bytes.NewReader(rom)); err != nil {
 		t.Fatalf("loading a %d byte program (the maximum): unexpected error: %s", maxSize, err)
 	}
