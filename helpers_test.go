@@ -54,7 +54,7 @@ func litPixels(d Display) int {
 // address.
 func newMachineWithROM(t *testing.T, rom []byte) *Machine {
 	t.Helper()
-	m := NewMachine(nil)
+	m := NewMachine()
 	if err := m.Load(bytes.NewReader(rom)); err != nil {
 		t.Fatalf("loading program: %s", err)
 	}
