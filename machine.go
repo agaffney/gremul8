@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"math/rand/v2"
 )
 
 const (
@@ -18,6 +19,7 @@ const (
 type Machine struct {
 	mem  [MemSize]byte
 	disp Display
+	rng  *rand.Rand
 	regV [16]uint8
 	regI uint16
 	pc   uint16
@@ -27,6 +29,7 @@ type Machine struct {
 func NewMachine(opts ...Option) *Machine {
 	m := &Machine{
 		disp: NewDummyDisplay(64, 32),
+		rng:  rand.New(rand.NewPCG(rand.Uint64(), rand.Uint64())),
 	}
 	for _, opt := range opts {
 		if opt != nil {
@@ -102,6 +105,8 @@ func (m *Machine) evalInstr(instr instruction) error {
 		return m.evalInstrA(instr)
 	case 0xb:
 		return m.evalInstrB(instr)
+	case 0xc:
+		return m.evalInstrC(instr)
 	case 0xd:
 		return m.evalInstrD(instr)
 	case 0xf:
@@ -264,6 +269,13 @@ func (m *Machine) evalInstrA(instr instruction) error {
 
 func (m *Machine) evalInstrB(instr instruction) error {
 	m.pc = instr.address() + uint16(m.regV[0x0])
+	return nil
+}
+
+func (m *Machine) evalInstrC(instr instruction) error {
+	regX := instr.nibble(1)
+	mask := instr.lower()
+	m.regV[regX] = uint8(m.rng.UintN(256)) & mask
 	return nil
 }
 
