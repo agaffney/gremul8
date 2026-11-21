@@ -1,8 +1,10 @@
 package gremul8
 
 import (
+	"bytes"
 	"fmt"
 	"math/bits"
+	"math/rand/v2"
 	"testing"
 )
 
@@ -1549,5 +1551,219 @@ func TestStoreLoadRoundTrip(t *testing.T) {
 	step(t, m)
 	if m.regV != want {
 		t.Errorf("registers after round trip = %v, want %v", m.regV, want)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// CXKK
+// ---------------------------------------------------------------------------
+
+// seededMachine returns a machine whose random numbers come from a fixed seed, so
+// that a test sees the same sequence on every run.
+func seededMachine(seed uint64) *Machine {
+	return NewMachine(WithRng(rand.New(rand.NewPCG(seed, seed))))
+}
+
+// draw runs a single CXKK instruction on the machine and returns the value it
+// put in VX. It rewinds the program counter first, so it can be called
+// repeatedly on the same machine.
+func draw(t *testing.T, m *Machine, x, mask byte) uint8 {
+	t.Helper()
+	m.mem[RomAddress] = 0xc0 | x
+	m.mem[RomAddress+1] = mask
+	m.pc = RomAddress
+	step(t, m)
+	return m.regV[x]
+}
+
+// The result must never have a bit set that the mask clears, and a zero mask must
+// always give zero.
+func TestRandMask(t *testing.T) {
+	for _, mask := range []byte{0x00, 0x01, 0x0f, 0xf0, 0x55, 0xaa, 0x81, 0xfe, 0xff} {
+		t.Run(fmt.Sprintf("%02x", mask), func(t *testing.T) {
+			m := seededMachine(1)
+			for range 2000 {
+				if got := draw(t, m, 3, mask); got&^mask != 0 {
+					t.Fatalf("CXKK with mask %02x gave %02x, which has bits outside the mask", mask, got)
+				}
+			}
+		})
+	}
+}
+
+// Over many draws, every value the mask allows must turn up, and nothing else.
+// With a full mask that means all 256 values, including 0x00 and 0xff, so a
+// generator that stops one short of the top (or bottom) of the range fails. The
+// seed is fixed, so this is deterministic; 20000 draws leave a negligible chance
+// that a correct generator misses a value.
+func TestRandCoversEveryAllowedValue(t *testing.T) {
+	for _, mask := range []byte{0xff, 0x0f, 0xf0, 0x81, 0x00} {
+		t.Run(fmt.Sprintf("%02x", mask), func(t *testing.T) {
+			m := seededMachine(2)
+			seen := map[uint8]bool{}
+			for range 20000 {
+				seen[draw(t, m, 0, mask)] = true
+			}
+			if want := 1 << bits.OnesCount8(mask); len(seen) != want {
+				t.Errorf("saw %d distinct values with mask %02x, want %d", len(seen), mask, want)
+			}
+			if mask == 0xff {
+				for _, v := range []uint8{0x00, 0x7f, 0x80, 0xff} {
+					if !seen[v] {
+						t.Errorf("never saw %02x", v)
+					}
+				}
+			}
+		})
+	}
+}
+
+// Each bit should come up both set and clear, independently of the others.
+func TestRandEveryBitVaries(t *testing.T) {
+	m := seededMachine(3)
+	var ones, zeros uint8
+	for range 500 {
+		got := draw(t, m, 1, 0xff)
+		ones |= got
+		zeros |= ^got
+	}
+	if ones != 0xff {
+		t.Errorf("bits that were never set: %08b", ^ones)
+	}
+	if zeros != 0xff {
+		t.Errorf("bits that were never clear: %08b", ^zeros)
+	}
+}
+
+// CXKK writes VX and nothing else, including when X is VF.
+func TestRandOnlyWritesVx(t *testing.T) {
+	for x := range byte(16) {
+		t.Run(fmt.Sprintf("V%X", x), func(t *testing.T) {
+			// A zero mask must make VX exactly 0 whatever it held before.
+			m := seededMachine(4)
+			for i := range m.regV {
+				m.regV[i] = 0xee
+			}
+			m.regI = 0x123
+			before := m.regV
+			draw(t, m, x, 0x00)
+			if m.regV[x] != 0 {
+				t.Errorf("V%X = %02x, want 0 with a zero mask", x, m.regV[x])
+			}
+			for i := range m.regV {
+				if byte(i) != x && m.regV[i] != before[i] {
+					t.Errorf("V%X changed from %02x to %02x", i, before[i], m.regV[i])
+				}
+			}
+			if m.regI != 0x123 {
+				t.Errorf("I = %03x, want it unchanged", m.regI)
+			}
+			if m.pc != RomAddress+InstructionSize {
+				t.Errorf("pc = %03x, want %03x", m.pc, RomAddress+InstructionSize)
+			}
+
+			// A full mask must put the drawn values in VX, and only there. Over
+			// several draws VX has to take more than one value, which it cannot do
+			// if the result is routed to a different register.
+			m = seededMachine(4)
+			for i := range m.regV {
+				m.regV[i] = 0
+			}
+			seen := map[uint8]bool{}
+			for range 32 {
+				seen[draw(t, m, x, 0xff)] = true
+				for i := range m.regV {
+					if byte(i) != x && m.regV[i] != 0 {
+						t.Fatalf("V%X = %02x after a draw into V%X, want 0", i, m.regV[i], x)
+					}
+				}
+			}
+			if len(seen) < 2 {
+				t.Errorf("V%X took %d distinct value(s) over 32 draws with a full mask", x, len(seen))
+			}
+		})
+	}
+}
+
+// Consecutive CXKKs must draw new numbers rather than repeating one.
+func TestRandAdvancesSequence(t *testing.T) {
+	m := seededMachine(5)
+	first := draw(t, m, 0, 0xff)
+	repeats := 0
+	for range 50 {
+		if draw(t, m, 0, 0xff) == first {
+			repeats++
+		}
+	}
+	if repeats == 50 {
+		t.Errorf("every draw gave %02x", first)
+	}
+}
+
+// The injected source is what CXKK uses: the same seed gives the same sequence,
+// and a different seed gives a different one.
+func TestRandUsesInjectedSource(t *testing.T) {
+	sequence := func(seed uint64) [32]uint8 {
+		m := seededMachine(seed)
+		var out [32]uint8
+		for i := range out {
+			out[i] = draw(t, m, 2, 0xff)
+		}
+		return out
+	}
+	if a, b := sequence(7), sequence(7); a != b {
+		t.Errorf("same seed gave different sequences:\n%v\n%v", a, b)
+	}
+	if a, b := sequence(7), sequence(8); a == b {
+		t.Errorf("different seeds gave the same sequence: %v", a)
+	}
+}
+
+// The default source must be seeded differently for each machine. Two machines
+// built without WithRng drawing the same 8 bytes by chance has odds of 2^-64,
+// so this does not flake; a fixed default seed fails it every time.
+func TestRandDefaultSourceIsSeededPerMachine(t *testing.T) {
+	first8 := func(m *Machine) [8]uint8 {
+		var out [8]uint8
+		for i := range out {
+			out[i] = draw(t, m, 0, 0xff)
+		}
+		return out
+	}
+	for name, mk := range map[string]func() *Machine{
+		"no option":  func() *Machine { return NewMachine() },
+		"nil source": func() *Machine { return NewMachine(WithRng(nil)) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			if a, b := first8(mk()), first8(mk()); a == b {
+				t.Errorf("two default machines drew the same sequence: %v", a)
+			}
+		})
+	}
+}
+
+// Load resets the machine but keeps its configuration, so the random source
+// survives it, and carries on from where it was rather than starting over.
+func TestRandSourceSurvivesLoad(t *testing.T) {
+	// Two consecutive draws from an identically seeded machine that is never
+	// reloaded
+	ref := seededMachine(9)
+	want1 := draw(t, ref, 0, 0xff)
+	want2 := draw(t, ref, 0, 0xff)
+	if want1 == want2 {
+		t.Fatalf("seed 9 gives the same first two draws (%02x); pick a seed that doesn't", want1)
+	}
+
+	m := seededMachine(9)
+	if got := draw(t, m, 0, 0xff); got != want1 {
+		t.Fatalf("first draw = %02x, want %02x", got, want1)
+	}
+	if err := m.Load(bytes.NewReader([]byte{0xc0, 0xff})); err != nil {
+		t.Fatal(err)
+	}
+	step(t, m)
+	if m.regV[0] != want2 {
+		t.Errorf("draw after Load = %02x, want %02x (the second draw, not a restart, which would give %02x)",
+			m.regV[0], want2, want1)
 	}
 }
