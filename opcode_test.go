@@ -1767,3 +1767,214 @@ func TestRandSourceSurvivesLoad(t *testing.T) {
 			m.regV[0], want2, want1)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// FX07, FX15, FX18, FX29
+// ---------------------------------------------------------------------------
+
+func TestLoadVxDelayTimer(t *testing.T) { // FX07
+	for x := range byte(16) {
+		t.Run(fmt.Sprintf("V%X", x), func(t *testing.T) {
+			m, err := runF(t, x, 0x07, func(m *Machine) {
+				m.delayTimer = 0x42
+				m.soundTimer = 0x17
+				for i := range m.regV {
+					m.regV[i] = 0xee
+				}
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if m.regV[x] != 0x42 {
+				t.Errorf("V%X = %02x, want 42", x, m.regV[x])
+			}
+			for i := range m.regV {
+				if byte(i) != x && m.regV[i] != 0xee {
+					t.Errorf("V%X changed to %02x", i, m.regV[i])
+				}
+			}
+			if m.delayTimer != 0x42 || m.soundTimer != 0x17 {
+				t.Errorf("timers = %02x, %02x; want 42, 17 (unchanged)", m.delayTimer, m.soundTimer)
+			}
+		})
+	}
+}
+
+func TestLoadVxDelayTimerZero(t *testing.T) {
+	m, err := runF(t, 5, 0x07, func(m *Machine) { m.regV[5] = 0xff })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.regV[5] != 0 {
+		t.Errorf("V5 = %02x, want 0 (the timer's value)", m.regV[5])
+	}
+}
+
+func TestLoadDelayTimerVx(t *testing.T) { // FX15
+	for _, v := range []uint8{0, 1, 0x3c, 0x80, 0xff} {
+		for _, x := range []byte{0, 7, 0xf} {
+			t.Run(fmt.Sprintf("V%X=%02x", x, v), func(t *testing.T) {
+				m, err := runF(t, x, 0x15, func(m *Machine) {
+					m.regV[x] = v
+					m.delayTimer = 0x99
+					m.soundTimer = 0x17
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if m.delayTimer != v {
+					t.Errorf("delay timer = %02x, want %02x", m.delayTimer, v)
+				}
+				if m.soundTimer != 0x17 {
+					t.Errorf("sound timer = %02x, want it unchanged (17)", m.soundTimer)
+				}
+				if m.regV[x] != v {
+					t.Errorf("V%X = %02x, want it unchanged (%02x)", x, m.regV[x], v)
+				}
+			})
+		}
+	}
+}
+
+func TestLoadSoundTimerVx(t *testing.T) { // FX18
+	for _, v := range []uint8{0, 1, 0x3c, 0x80, 0xff} {
+		for _, x := range []byte{0, 7, 0xf} {
+			t.Run(fmt.Sprintf("V%X=%02x", x, v), func(t *testing.T) {
+				m, err := runF(t, x, 0x18, func(m *Machine) {
+					m.regV[x] = v
+					m.soundTimer = 0x99
+					m.delayTimer = 0x17
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if m.soundTimer != v {
+					t.Errorf("sound timer = %02x, want %02x", m.soundTimer, v)
+				}
+				if m.delayTimer != 0x17 {
+					t.Errorf("delay timer = %02x, want it unchanged (17)", m.delayTimer)
+				}
+				if m.regV[x] != v {
+					t.Errorf("V%X = %02x, want it unchanged (%02x)", x, m.regV[x], v)
+				}
+			})
+		}
+	}
+}
+
+// A value written with FX15 is the one FX07 reads back, and the two timers don't
+// share storage.
+func TestDelayAndSoundTimersAreSeparate(t *testing.T) {
+	m := newMachineWithROM(t, []byte{
+		0x60, 0x11, // LD V0, 0x11
+		0x61, 0x22, // LD V1, 0x22
+		0xf0, 0x15, // LD DT, V0
+		0xf1, 0x18, // LD ST, V1
+		0xf2, 0x07, // LD V2, DT
+	})
+	for range 5 {
+		step(t, m)
+	}
+	if m.regV[2] != 0x11 {
+		t.Errorf("V2 = %02x, want 11 (the delay timer, not the sound timer)", m.regV[2])
+	}
+	if m.soundTimer != 0x22 {
+		t.Errorf("sound timer = %02x, want 22", m.soundTimer)
+	}
+}
+
+func TestLoadISprite(t *testing.T) { // FX29
+	for d := range 16 {
+		t.Run(fmt.Sprintf("%X", d), func(t *testing.T) {
+			m, err := runF(t, 3, 0x29, func(m *Machine) {
+				m.regV[3] = uint8(d)
+				m.regI = 0x777
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if want := uint16(0x050 + d*5); m.regI != want {
+				t.Errorf("I = %03x, want %03x", m.regI, want)
+			}
+			for i, b := range wantFont[d] {
+				if got := m.mem[int(m.regI)+i]; got != b {
+					t.Errorf("mem[I+%d] = %02x, want %02x", i, got, b)
+				}
+			}
+			if m.regV[3] != uint8(d) {
+				t.Errorf("V3 = %02x, want it unchanged", m.regV[3])
+			}
+		})
+	}
+}
+
+func TestLoadISpriteWithVF(t *testing.T) {
+	m, err := runF(t, 0xf, 0x29, func(m *Machine) { m.regV[0xf] = 0xa })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := uint16(0x050 + 0xa*5); m.regI != want {
+		t.Errorf("I = %03x, want %03x", m.regI, want)
+	}
+}
+
+// Only the low nibble of VX selects the glyph.
+func TestLoadISpriteUsesLowNibble(t *testing.T) {
+	for _, tc := range []struct {
+		vx   uint8
+		want uint16
+	}{
+		{0x10, 0x050},
+		{0x1a, 0x050 + 0xa*5},
+		{0x7f, 0x050 + 0xf*5},
+		{0xff, 0x050 + 0xf*5},
+		{0x80, 0x050},
+	} {
+		t.Run(fmt.Sprintf("%02x", tc.vx), func(t *testing.T) {
+			m, err := runF(t, 0, 0x29, func(m *Machine) { m.regV[0] = tc.vx })
+			if err != nil {
+				t.Fatal(err)
+			}
+			if m.regI != tc.want {
+				t.Errorf("I = %03x, want %03x", m.regI, tc.want)
+			}
+		})
+	}
+}
+
+// FX29 followed by DXYN draws the digit, the way ROMs actually use it.
+func TestLoadISpriteThenDraw(t *testing.T) {
+	for d := range 16 {
+		t.Run(fmt.Sprintf("%X", d), func(t *testing.T) {
+			m := newMachineWithROM(t, []byte{
+				0xf0, 0x29, // LD F, V0
+				0xd1, 0x25, // DRW V1, V2, 5
+			})
+			m.regV[0] = uint8(d)
+			step(t, m)
+			step(t, m)
+			for y, row := range wantFont[d] {
+				want := ""
+				for bit := 7; bit >= 0; bit-- {
+					if row>>bit&1 == 1 {
+						want += "#"
+					} else {
+						want += "."
+					}
+				}
+				if got := rowString(m.disp, uint8(y))[:8]; got != want {
+					t.Errorf("row %d = %q, want %q", y, got, want)
+				}
+			}
+			if wantLit := func() int {
+				n := 0
+				for _, r := range wantFont[d] {
+					n += bits.OnesCount8(r)
+				}
+				return n
+			}(); litPixels(m.disp) != wantLit {
+				t.Errorf("%d pixels lit, want %d", litPixels(m.disp), wantLit)
+			}
+		})
+	}
+}

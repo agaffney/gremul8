@@ -54,6 +54,17 @@ func TestCorax(t *testing.T) {
 	testROM(t, "testdata/3-corax+.ch8", "testdata/3-corax+.txt", 306)
 }
 
+// The flags test checks how the arithmetic and shift instructions set VF. Like
+// Corax+, it draws a checkmark or cross per test.
+//
+// testdata/4-flags.txt is the published all-checkmarks screen,
+// pictures/flags.png in github.com/Timendus/chip8-test-suite, converted to
+// pixels with each light pixel as '#'. It was not produced by this emulator. The 960-step count is this emulator's own, and is
+// only a regression guard.
+func TestFlags(t *testing.T) {
+	testROM(t, "testdata/4-flags.ch8", "testdata/4-flags.txt", 960)
+}
+
 // ---------------------------------------------------------------------------
 // Drawing
 // ---------------------------------------------------------------------------

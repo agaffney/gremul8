@@ -7,6 +7,8 @@ import (
 	"io"
 	"math"
 	"math/rand/v2"
+	"sync"
+	"time"
 )
 
 const (
@@ -14,22 +16,30 @@ const (
 	BuiltinFontAddress = 0x050
 	RomAddress         = 0x200
 	StackMaxDepth      = 30
+	TickDuration       = time.Second / 60
 )
 
 type Machine struct {
-	mem  [MemSize]byte
-	disp Display
-	rng  *rand.Rand
-	regV [16]uint8
-	regI uint16
-	pc   uint16
-	sp   uint16
+	mu         sync.Mutex
+	done       chan struct{}
+	mem        [MemSize]byte
+	disp       Display
+	rng        *rand.Rand
+	regV       [16]uint8
+	regI       uint16
+	pc         uint16
+	sp         uint16
+	delayTimer uint8
+	soundTimer uint8
+	autoTick   bool
+	autoTicker *time.Ticker
 }
 
 func NewMachine(opts ...Option) *Machine {
 	m := &Machine{
 		disp: NewDummyDisplay(64, 32),
 		rng:  rand.New(rand.NewPCG(rand.Uint64(), rand.Uint64())),
+		done: make(chan struct{}),
 	}
 	for _, opt := range opts {
 		if opt != nil {
@@ -40,8 +50,21 @@ func NewMachine(opts ...Option) *Machine {
 	return m
 }
 
+func (m *Machine) Close() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	select {
+	case <-m.done:
+		return
+	default:
+	}
+	if m.autoTicker != nil {
+		m.autoTicker.Stop()
+	}
+	close(m.done)
+}
+
 func (m *Machine) Load(r io.Reader) error {
-	m.reset()
 	prgm, err := io.ReadAll(r)
 	if err != nil {
 		return err
@@ -49,23 +72,71 @@ func (m *Machine) Load(r io.Reader) error {
 	if len(prgm)+RomAddress > MemSize {
 		return errors.New("program size exceeds memory size")
 	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	select {
+	case <-m.done:
+		return errors.New("Close() has already been called")
+	default:
+	}
+	m.reset()
 	copy(m.mem[RomAddress:], prgm)
 	return nil
 }
 
 func (m *Machine) reset() {
+	if m.autoTicker != nil {
+		m.autoTicker.Stop()
+	}
 	m.disp.Clear()
 	m.mem = [MemSize]byte{}
 	m.pc = RomAddress
 	m.sp = 0
+	m.delayTimer = 0
+	m.soundTimer = 0
 	m.regV = [16]uint8{}
 	m.regI = 0
 	for i, ch := range BuiltinFont {
 		copy(m.mem[BuiltinFontAddress+(i*BuiltinFontWidth):], ch[:])
 	}
+	if m.autoTick {
+		if m.autoTicker == nil {
+			m.autoTicker = time.NewTicker(TickDuration)
+			go func() {
+				for {
+					select {
+					case <-m.autoTicker.C:
+					case <-m.done:
+						return
+					}
+					m.mu.Lock()
+					m.tick()
+					m.mu.Unlock()
+				}
+			}()
+		}
+		m.autoTicker.Reset(TickDuration)
+	}
+}
+
+func (m *Machine) tick() {
+	if m.delayTimer > 0 {
+		m.delayTimer--
+	}
+	if m.soundTimer > 0 {
+		m.soundTimer--
+	}
+}
+
+func (m *Machine) Tick() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.tick()
 }
 
 func (m *Machine) Step() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if m.pc+InstructionSize > MemSize {
 		return errors.New("program counter past end of memory")
 	}
@@ -300,11 +371,20 @@ func (m *Machine) evalInstrD(instr instruction) error {
 func (m *Machine) evalInstrF(instr instruction) error {
 	regX := instr.nibble(1)
 	switch instr.lower() {
+	case 0x07:
+		m.regV[regX] = m.delayTimer
+	case 0x15:
+		m.delayTimer = m.regV[regX]
+	case 0x18:
+		m.soundTimer = m.regV[regX]
 	case 0x1e:
 		if m.regI+uint16(m.regV[regX]) >= MemSize {
 			return errors.New("set I past end of memory")
 		}
 		m.regI += uint16(m.regV[regX])
+	case 0x29:
+		ch := m.regV[regX] & 0x0f
+		m.regI = BuiltinFontAddress + uint16(ch*BuiltinFontWidth)
 	case 0x33:
 		if m.regI+3 > MemSize {
 			return errors.New("write past end of memory")
