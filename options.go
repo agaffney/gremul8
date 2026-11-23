@@ -19,3 +19,9 @@ func WithRng(r *rand.Rand) Option {
 		}
 	}
 }
+
+func WithAutoTick(autoTick bool) Option {
+	return func(m *Machine) {
+		m.autoTick = autoTick
+	}
+}
