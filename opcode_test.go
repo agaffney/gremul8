@@ -92,6 +92,8 @@ func TestUnknownOpcodes(t *testing.T) {
 		// 1E, 29, 33, 55, 65; SCHIP's 30, 75, 85; XO-CHIP's 00 and 01 (F000,
 		// FN01), 02 (F002), 3A (FX3A), 75 and 85.)
 		0xf0fe, 0xf0ff, 0xf1fe, 0xf132, 0xf256, 0xf3a5, 0xf464, 0xfffe,
+		// EXnn other than EX9E and EXA1
+		0xe000, 0xe09f, 0xe09d, 0xe0a0, 0xe0a2, 0xe19f, 0xe1ff, 0xe261, 0xefff,
 	} {
 		t.Run(fmt.Sprintf("%04x", op), func(t *testing.T) {
 			m := newMachineWithROM(t, []byte{byte(op >> 8), byte(op)})

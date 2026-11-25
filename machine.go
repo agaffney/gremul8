@@ -33,6 +33,8 @@ type Machine struct {
 	soundTimer uint8
 	autoTick   bool
 	autoTicker *time.Ticker
+	keyPressed [16]bool
+	waitKey    int
 }
 
 func NewMachine(opts ...Option) *Machine {
@@ -96,6 +98,8 @@ func (m *Machine) reset() {
 	m.soundTimer = 0
 	m.regV = [16]uint8{}
 	m.regI = 0
+	m.waitKey = -1
+	m.keyPressed = [16]bool{}
 	for i, ch := range BuiltinFont {
 		copy(m.mem[BuiltinFontAddress+(i*BuiltinFontWidth):], ch[:])
 	}
@@ -132,6 +136,24 @@ func (m *Machine) Tick() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.tick()
+}
+
+func (m *Machine) KeyDown(k uint8) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if k >= 16 {
+		return
+	}
+	m.keyPressed[k] = true
+}
+
+func (m *Machine) KeyUp(k uint8) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if k >= 16 {
+		return
+	}
+	m.keyPressed[k] = false
 }
 
 func (m *Machine) Step() error {
@@ -180,6 +202,8 @@ func (m *Machine) evalInstr(instr instruction) error {
 		return m.evalInstrC(instr)
 	case 0xd:
 		return m.evalInstrD(instr)
+	case 0xe:
+		return m.evalInstrE(instr)
 	case 0xf:
 		return m.evalInstrF(instr)
 	default:
@@ -368,11 +392,46 @@ func (m *Machine) evalInstrD(instr instruction) error {
 	return nil
 }
 
+func (m *Machine) evalInstrE(instr instruction) error {
+	regX := instr.nibble(1)
+	k := m.regV[regX] & 0x0f
+	switch instr.lower() {
+	case 0x9e:
+		if m.keyPressed[k] {
+			m.pc += InstructionSize
+		}
+	case 0xa1:
+		if !m.keyPressed[k] {
+			m.pc += InstructionSize
+		}
+	default:
+		return fmt.Errorf("unknown instruction: %04x", instr.all())
+	}
+	return nil
+}
+
 func (m *Machine) evalInstrF(instr instruction) error {
 	regX := instr.nibble(1)
 	switch instr.lower() {
 	case 0x07:
 		m.regV[regX] = m.delayTimer
+	case 0x0a:
+		if m.waitKey < 0 {
+			for i, b := range m.keyPressed {
+				if b {
+					m.waitKey = i
+					break
+				}
+			}
+		} else {
+			if !m.keyPressed[uint8(m.waitKey)] {
+				m.regV[regX] = uint8(m.waitKey)
+				m.waitKey = -1
+				return nil
+			}
+		}
+		// Repeat this instruction
+		m.pc -= InstructionSize
 	case 0x15:
 		m.delayTimer = m.regV[regX]
 	case 0x18:
