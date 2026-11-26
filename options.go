@@ -25,3 +25,9 @@ func WithAutoTick(autoTick bool) Option {
 		m.autoTick = autoTick
 	}
 }
+
+func WithQuirks(quirks Quirks) Option {
+	return func(m *Machine) {
+		m.quirks = quirks
+	}
+}

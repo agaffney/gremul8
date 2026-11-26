@@ -22,6 +22,7 @@ const (
 type Machine struct {
 	mu         sync.Mutex
 	done       chan struct{}
+	quirks     Quirks
 	mem        [MemSize]byte
 	disp       Display
 	rng        *rand.Rand
